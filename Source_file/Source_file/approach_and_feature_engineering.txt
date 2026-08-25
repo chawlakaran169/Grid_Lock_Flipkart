@@ -1,0 +1,142 @@
+======================================================================
+  TRAFFIC DEMAND PREDICTION
+  APPROACH & FEATURE ENGINEERING NOTES
+======================================================================
+
+Metric  : max(0, 100 * r2_score(actual, predicted))
+Dataset : train.csv (77,299 × 11)  |  test.csv (41,778 × 10)
+Target  : demand  (traffic demand at a location × timestamp)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROBLEM FRAMING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Traffic demand is a spatio-temporal regression problem. The key
+insight is that demand follows repeating patterns:
+  • TIME     — rush hours (07–09, 17–19), weekdays vs. weekends
+  • SPACE    — urban hotspots, road type, proximity to landmarks
+  • CONTEXT  — weather, temperature suppress or amplify demand
+
+An ensemble of gradient boosted trees is ideal here because:
+  ✓ Handles mixed numeric + categorical features natively
+  ✓ Captures non-linear interactions automatically
+  ✓ Robust to outliers (demand spikes)
+  ✓ No feature scaling required
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. FEATURE ENGINEERING DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── 2A. GEOHASH DECODING & SPATIAL HIERARCHY ────────────────────────
+  Raw: "geohash" string (e.g., "w3gv2c")
+
+  • Decoded to latitude & longitude using pygeohash library.
+    This gives the model true geographic distance information.
+
+  • Created 4 prefix levels to capture spatial hierarchy:
+      geo3 → ~156 km²  (regional level)
+      geo4 → ~20 km²   (neighbourhood level)
+      geo5 → ~2.4 km²  (street level)
+      geo6 → full hash  (exact point)
+    Shorter prefixes group nearby locations, helping the model
+    generalise to test locations with few training examples.
+
+  • All prefix strings label-encoded to integers.
+
+── 2B. TIMESTAMP DECOMPOSITION ────────────────────────────────────
+  Raw: "timestamp" (datetime string)
+
+  • hour, minute  — extracted directly
+  • hhmm          — minute-of-day (0–1439); fine-grained time signal
+  • is_peak_am    — binary: hour ∈ [7, 9]   (morning rush)
+  • is_peak_pm    — binary: hour ∈ [17, 19] (evening rush)
+  • is_night      — binary: hour ∉ [6, 22]
+  • is_midday     — binary: hour ∈ [11, 13]
+
+  CYCLICAL ENCODING (critical for continuity):
+  • hour_sin = sin(2π × hour / 24)
+  • hour_cos = cos(2π × hour / 24)
+  → Without this, the model treats hour 23 and hour 0 as far
+    apart, when they are actually adjacent.
+  • hhmm_sin / hhmm_cos — same trick at minute resolution
+
+── 2C. DAY-OF-WEEK FEATURES ────────────────────────────────────────
+  Raw: "day" (string: "Monday" … "Sunday")
+
+  • day_num    — integer 0 (Mon) to 6 (Sun)
+  • is_weekend — binary flag
+  • day_sin / day_cos — cyclical encoding for 7-day week
+
+── 2D. INTERACTION FEATURES ────────────────────────────────────────
+  Explicit joint keys that trees can split on directly:
+
+  • geo4_hour    — location (4-char) × hour-of-day
+                  (captures "this area is busy at 8 AM")
+  • geo4_day     — location × day-of-week
+  • day_hour     — day × hour  (full weekly time slot)
+  • geo4_peak_am — location × morning-peak flag
+  • geo4_peak_pm — location × evening-peak flag
+  • geo4_weekend — location × weekend flag
+
+  All string-concatenated then label-encoded.
+
+── 2E. ROAD INFRASTRUCTURE ─────────────────────────────────────────
+  • NumberofLanes  — kept as numeric; coerced to int (NaN → 0)
+  • high_capacity  — binary: lanes ≥ 4
+  • single_lane    — binary: lanes == 1
+  • LargeVehicles  — binarised: "Yes"/"1"/"True" → 1, else 0
+  • Landmarks      — binarised: same rule
+
+── 2F. WEATHER & TEMPERATURE ───────────────────────────────────────
+  • Temperature    — numeric; NaN imputed with training median
+  • temp_missing   — indicator flag for imputed rows
+  • temp_high      — binary: above 75th percentile
+  • temp_low       — binary: below 25th percentile
+  • Weather        — label-encoded category
+
+── 2G. TARGET AGGREGATION FEATURES (most impactful) ────────────────
+  For each grouping key, computed mean / median / std / count
+  of the TRAINING demand, then merged onto both sets.
+
+  Groups used:
+    geo3, geo4, geo5, geo6          — location-level demand priors
+    hour, day_num                   — time-level demand priors
+    day_hour, geo4_hour, geo4_day   — joint location×time priors
+    RoadType, Weather               — road/weather demand priors
+
+  WHY SAFE (no leakage): statistics are computed on the full
+  training set and applied as fixed lookup values — no row-level
+  target information is used in cross-validation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. MODELLING STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Three independently trained models + score-weighted blend:
+
+  ┌─────────────┬──────────────────────────────────────────────────┐
+  │ Model       │ Key Hyperparameters                              │
+  ├─────────────┼──────────────────────────────────────────────────┤
+  │ LightGBM    │ num_leaves=255, lr=0.02, n_est=3000,            │
+  │             │ feature_frac=0.75, bag_frac=0.75, ES=150        │
+  ├─────────────┼──────────────────────────────────────────────────┤
+  │ XGBoost     │ max_depth=8, lr=0.02, n_est=3000,               │
+  │             │ subsample=0.75, colsample=0.75, ES=150          │
+  ├─────────────┼──────────────────────────────────────────────────┤
+  │ CatBoost    │ depth=8, lr=0.02, iter=3000,                    │
+  │             │ l2_leaf_reg=3, od_wait=150                      │
+  └─────────────┴──────────────────────────────────────────────────┘
+
+  Cross-Validation : 5-Fold KFold (shuffled, seed=42)
+  Final test preds : Average of predictions across 5 folds
+  Blend weights    : Proportional to each model's OOF score
+  Post-processing  : clip(predictions, 0, ∞)  — demand ≥ 0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. FILES IN THIS SUBMISSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  traffic_demand_prediction.py        Main pipeline script
+  approach_and_feature_engineering.txt  This document
+  submission.csv                      41778 × 2  (Index, demand)
+
+======================================================================
